@@ -4,12 +4,13 @@ import time
 import math
 import networkx
 from datetime import datetime
-
+from find_initial_solution import *
 from collections import defaultdict
 from parse_graph import *
 from paint_graph import *
 from cplex._internal._subinterfaces import VarTypes
-
+import sys
+sys.setrecursionlimit(11000)
 
 class Solver:
     def __init__(
@@ -19,19 +20,20 @@ class Solver:
             start_time: datetime,
             ILP: bool = True,
             max_recursion_depth: int = 100,
-            max_second_limit:int=300
+            max_second_limit: int=300,
     ):
         self.start_time = start_time
         self.max_second_limit = max_second_limit
         self.max_recursion_depth = max_recursion_depth
         self.one = 1 if ILP else 1.0
         self.zero = 0 if ILP else 0.0
-        self.type = VarTypes.binary if ILP else VarTypes.semi_continuous
+        self.type = VarTypes.binary if ILP else VarTypes.continuous
 
         # cplex
         self.cplex: cplex.Cplex = None
 
         self.graph = graph
+        self.nodes = list(sorted(graph.nodes)) # networkx их пересортирует в своем порядке, храним отсортированными для норм маппинга
 
         # Независимые множества из раскраски
         self.ind_sets = set(map(lambda x: tuple(x), colors_grouped))
@@ -47,7 +49,7 @@ class Solver:
 
 
     def initialize_variables(self, c: cplex.Cplex):
-        nodes = self.graph.nodes
+        nodes = self.nodes
         nodes_len = len(nodes)
         # Максимизируем целевую функцию (количество вершин в клике)
         c.objective.set_sense(c.objective.sense.maximize)
@@ -64,7 +66,9 @@ class Solver:
                       nx.coloring.strategy_independent_set,
                       nx.coloring.strategy_connected_sequential_bfs,
                       nx.coloring.strategy_connected_sequential_dfs,
-                      nx.coloring.strategy_saturation_largest_first
+                      nx.coloring.strategy_saturation_largest_first,
+                      nx.coloring.strategy_smallest_last,
+                      nx.coloring.strategy_largest_first,
                       ]
 
         for strategy in strategies:
@@ -116,7 +120,15 @@ class Solver:
 
     def get_branching_var(self, solution: list):
         enumerated_not_ints = [x for x in enumerate(solution) if not x[1].is_integer()]
-        return max(enumerated_not_ints, key=lambda x: x[1], default=(None, None))[0]
+        if not len(enumerated_not_ints):
+            return None
+
+        closest_to_1 = max(enumerated_not_ints, key=lambda x: x[1], default=(None, None))
+        closest_to_0 = min(enumerated_not_ints, key=lambda x: x[1], default=(None, None))
+
+        if closest_to_0[1] < 1 - closest_to_1[1]:
+            return closest_to_0[0]
+        return closest_to_1[0]
 
     def add_branching_constraint(self, value: float, boundary: float, branch_num: int, sense: str):
         self.cplex.linear_constraints.add(lin_expr=[[[value], [self.one]]],
@@ -138,18 +150,20 @@ class Solver:
         return sum([1 for x in self.cplex.solution.get_values() if x == 1])
 
     def rounded_solution(self, solution: List[float]):
-        return list(map(lambda x: round(x, 3), solution))
+        return list(map(lambda x: round(x, 5), solution))
 
     def branching(self, recursion_depth: int):
-        if (recursion_depth > self.max_recursion_depth) \
-                or \
-                (datetime.now() - self.start_time).total_seconds() > self.max_second_limit:
+        passed = (datetime.now() - self.start_time).total_seconds()
+
+        if recursion_depth > self.max_recursion_depth or passed > self.max_second_limit:
             return
 
         self.cplex.solve()
         solution = self.cplex.solution.get_values()
         solution = self.rounded_solution(solution)
-        cur_objective_value = self.cplex.solution.get_objective_value()
+
+        cur_objective_value = sum(solution)
+
         # Если можно улучшить решение
         if cur_objective_value > self.current_max_clique_size:
             # Получаем индекс максимальной не целой переменной
@@ -170,14 +184,20 @@ class Solver:
                     self.go_right(branching_var, cur_branch, recursion_depth)
 
     def get_clique(self, solution: List[float]):
-        nodes = list(self.graph.nodes)
+        nodes = self.nodes
         solution_idx = [v[0] for v in enumerate(solution) if v[1] == 1]
         clique = [nodes[idx] for idx in solution_idx]
         return clique
 
-    def assert_clique(self, clique: List[int]):
-        clique_size = len(clique)
+    def clique_to_solution(self, clique: List[int]):
+        solution = [0] * len(self.nodes)
+        for vertex in clique:
+            solution[vertex - 1] = 1
 
+        return solution
+
+    def check_clique(self,  clique: List[int]):
+        clique_size = len(clique)
         clique_set = set(clique)
         for node in clique:
             edges = set(map(lambda x: x[1], self.graph.edges(node)))
@@ -185,44 +205,75 @@ class Solver:
             intersection_size = len(intersection)
             # + 1 вершина (node)
             if intersection_size + 1 != clique_size:
-                raise Exception('Solution is not a clique!')
+                return False
         return True
 
+    def assert_clique(self, clique: List[int]):
+        result = self.check_clique(clique)
+
+        if not result:
+            raise Exception('Solution is not a clique!')
+
     def solve(self):
+        initial_clique = find_initial_solution(self.graph)
+        self.assert_clique(initial_clique)
+        initial_solution = self.clique_to_solution(initial_clique)
+        self.best_solution = initial_solution
+        self.current_max_clique_size = len(initial_clique)
+
         self.initialize_cplex()
         self.branching(0)
-        if self.best_solution is None:
-            return [], 0 #Клика не найдена
-
         clique = self.get_clique(self.best_solution)
         self.assert_clique(clique)
 
         return clique, len(clique)
 
 def main():
-    filenames = [
+    easy = (
+        'c-fat200-1.clq',
+        'c-fat200-2.clq',
+        'c-fat200-5.clq',
+        'c-fat500-1.clq',
+        'c-fat500-10.clq',
+        'c-fat500-2.clq',
+        'c-fat500-5.clq',
+        'gen200_p0.9_55.clq',
+        'johnson8-2-4.clq',
+        'johnson8-4-4.clq',
+        'johnson16-2-4.clq',
+        'hamming6-2.clq',
+        'hamming6-4.clq',
+        'hamming8-2.clq',
+        'hamming8-4.clq',
+        'MANN_a9.clq',
+        'san200_0.7_1.clq',
+        'san200_0.9_1.clq',
+        'san200_0.9_2.clq'
+    )
+
+    hard = (
         'brock200_1.clq',
         'brock200_2.clq',
         'brock200_3.clq',
         'brock200_4.clq',
         'C125.9.clq',
         'gen200_p0.9_44.clq',
-        'gen200_p0.9_55.clq',
-        'hamming8-4.clq',
-        'johnson16-2-4.clq',
-        'johnson8-2-4.clq',
         'keller4.clq',
         'MANN_a27.clq',
-        'MANN_a9.clq',
-        'p_hat1000-1.clq',
-        'p_hat1500-1.clq',
+        'MANN_a45.clq',
+        'p_hat300-1.clq',
+        'p_hat300-2.clq',
         'p_hat300-3.clq',
-        'san1000.clq',
-        'sanr200_0.9.clq'
-                 ]
+        'san200_0.9_3.clq',
+        'sanr200_0.7.clq',
+     )
 
-    for ilp in [False]:
-        print('-----------------------------------')
+    files = {
+        'easy': easy,
+        'hard': hard,
+    }
+    for type_of_graphs, filenames in files.items():
+        print(type_of_graphs)
         for filename in filenames:
             # Парсим и строим граф
             v, e, edges = parse_file(f'resources/{filename}')
@@ -233,7 +284,7 @@ def main():
             graph = get_graph(edges)
 
             # Получаем решение
-            solver = Solver(graph, colors_grouped, start_time=start, ILP=ilp, max_recursion_depth=1000, max_second_limit=300)
+            solver = Solver(graph, colors_grouped, start_time=start, ILP=False, max_recursion_depth=10000, max_second_limit=3600)
             clique, clique_size = solver.solve()
 
             execution_time = (datetime.now() - start).total_seconds()
