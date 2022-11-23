@@ -264,6 +264,7 @@ def main():
         'p_hat300-1.clq',
         'p_hat300-2.clq',
         'p_hat300-3.clq',
+        'san200_0.7_2.clq',
         'san200_0.9_3.clq',
         'sanr200_0.7.clq',
      )
